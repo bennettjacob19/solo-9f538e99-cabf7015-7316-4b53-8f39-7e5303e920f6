@@ -25,7 +25,7 @@ from pathlib import Path
 
 import anyio
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import (
     HTMLResponse,
@@ -35,6 +35,7 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
+from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from .config import Settings
@@ -83,6 +84,49 @@ sudo apt-get download &lt;package&gt;</pre>
 def _media_type(relpath: str) -> str:
     name = relpath.rsplit("/", 1)[-1]
     return _MEDIA_TYPES.get(name, "application/octet-stream")
+
+
+class ManifestGroup(BaseModel):
+    group: int = Field(description="清单分组编号；同组构建留存的 md5sums 完全相同")
+    publication_ids: list[int] = Field(description="同组的发布号（成功发布的 journal id）")
+    note: str | None = Field(None, description="同组多于一个构建时标注「清单相同，并列」")
+
+
+class BuildEvidence(BaseModel):
+    publication_id: int = Field(description="该摘要最后一次成功发布的发布号")
+    release_number: int = Field(description="发布号（与 publication_id 相同）")
+    package: str = Field(description="包名原文")
+    version: str = Field(description="版本原文")
+    architecture: str = Field(description="架构")
+    sha256: str = Field(description=".deb 文件的 SHA-256 摘要")
+    created_at: str = Field(description="发布时间（UTC）")
+    manifest_group: int | None = Field(
+        None, description="清单分组编号；缺少可用清单时为 null"
+    )
+    note: str | None = Field(
+        None, description="缺少可用清单时为「证据不足」，否则为 null"
+    )
+    md5: dict[str, str] = Field(
+        description="键为区分全部清单所需的最少文件路径，值为该路径的 MD5；"
+        "清单未列出该路径时为「未列出」"
+    )
+
+
+class BuildIdentification(BaseModel):
+    package: str
+    version: str
+    query_limit: int = Field(description="按 .deb SHA-256 去重后最多返回的成功构建数（6）")
+    distinguishing_paths: list[str] = Field(
+        description="区分所有不同清单所需的最少文件路径（按字典序）"
+    )
+    not_listed_marker: str = Field(description="路径未列入清单时的取值：「未列出」")
+    insufficient_evidence_marker: str = Field(
+        description="缺少可用清单时的标注：「证据不足」"
+    )
+    groups: list[ManifestGroup] = Field(description="清单分组；相同清单的构建并列")
+    builds: list[BuildEvidence] = Field(
+        description="去重后的构建，按最后一次成功发布号从新到旧排列"
+    )
 
 
 _STREAM_CHUNK = 256 * 1024
@@ -234,6 +278,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse(
             {"publications": [p.to_dict() for p in repository.list_publications(50)]}
         )
+
+    @app.get(
+        "/api/builds/identify",
+        response_model=BuildIdentification,
+        summary="按包名和版本辨认隔离区主机安装的构建",
+        description=(
+            "输入包名与版本原文（与控制字段 Package / Version 完全一致）。"
+            "服务按 .deb 的 SHA-256 去重，取最近 6 份成功构建；同一摘要只保留"
+            "最后一次成功发布号。返回区分所有不同 md5sums 清单所需的最少文件"
+            "路径，并逐个构建给出这些路径的 MD5 或「未列出」。清单相同的构建"
+            "并列同组；缺少可用清单的构建标注为「证据不足」。失败的发布不进入"
+            "查询；包被回收后仍可用发布时留存的清单生成核对结果。"
+        ),
+    )
+    def identify_builds(
+        package: str = Query(..., description="包名原文，例如 smoke-one"),
+        version: str = Query(..., description="版本原文，例如 1.0.0"),
+    ) -> BuildIdentification:
+        package = package.strip()
+        version = version.strip()
+        if not package or not version:
+            raise HTTPException(
+                status_code=400, detail="package and version must be non-empty"
+            )
+        return BuildIdentification(**repository.identify_builds(package, version))
 
     def _lease_headers(lease) -> dict[str, str]:  # type: ignore[no-untyped-def]
         return {

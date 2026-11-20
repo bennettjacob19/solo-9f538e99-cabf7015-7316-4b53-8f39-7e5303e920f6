@@ -77,6 +77,10 @@ class DebInfo:
     version: str
     architecture: str
     fields: tuple[tuple[str, str], ...]
+    #: Parsed ``md5sums`` from the control archive as ``(path, md5)`` pairs,
+    #: in file order.  ``None`` means the member is missing; an empty tuple
+    #: means it exists but carries no usable entries.
+    md5sums: tuple[tuple[str, str], ...] | None = None
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -309,6 +313,75 @@ def _extract_control_bytes(control_tar: bytes, member_name: str) -> bytes:
         raise DebError(f"not a Debian package: invalid {member_name}: {exc}") from exc
 
 
+#: Cap on the retained md5sums member; real packages stay well below this.
+MAX_MD5SUMS_BYTES = 16 * 1024 * 1024
+#: A dpkg md5sums line: 32 hex digits, two spaces, then the installed path.
+_MD5SUMS_LINE_RE = re.compile(r"^([0-9a-fA-F]{32}) {2}(.+)$")
+
+
+def _extract_md5sums_bytes(control_tar: bytes) -> bytes | None:
+    """Return the raw ``md5sums`` member, or ``None`` when it is absent.
+
+    Only a regular top-level ``md5sums`` file is considered; directories or
+    nested entries are ignored so the lookup cannot be spoofed.
+    """
+
+    try:
+        with tarfile.open(fileobj=io.BytesIO(control_tar), mode="r:") as archive:
+            for member in archive:
+                if member.name.lstrip("./") == "md5sums" and member.isfile():
+                    stream = archive.extractfile(member)
+                    if stream is None:
+                        return None
+                    return stream.read(MAX_MD5SUMS_BYTES + 1)
+    except (tarfile.TarError, OSError) as exc:
+        raise DebError(f"not a Debian package: invalid control archive: {exc}") from exc
+    return None
+
+
+def parse_md5sums(raw: bytes | None) -> tuple[tuple[str, str], ...] | None:
+    """Parse the raw ``md5sums`` member.
+
+    Returns ``None`` when the member is missing.  Malformed or empty members
+    yield an empty tuple, which the publisher stores as "no usable manifest"
+    while still accepting the package.
+    """
+
+    if raw is None:
+        return None
+    if len(raw) > MAX_MD5SUMS_BYTES:
+        raise DebError("package md5sums member is unreasonably large")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DebError("package md5sums member is not valid UTF-8") from exc
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        match = _MD5SUMS_LINE_RE.match(line)
+        if not match:
+            # dpkg writes the strict format; anything else means the member
+            # cannot be trusted as evidence.
+            continue
+        digest, path = match.group(1).lower(), match.group(2)
+        # dpkg writes installed paths such as "/etc/app.conf"; some tools emit
+        # the equivalent relative form ("etc/app.conf" or "./etc/app.conf").
+        # Normalise to the absolute dpkg spelling so equal files share a key.
+        if path.startswith("./"):
+            path = path[2:]
+        if not path.startswith("/"):
+            path = "/" + path
+        if "\x00" in path:
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        entries.append((path, digest))
+    return tuple(entries)
+
+
 def parse_control_text(text: str) -> tuple[tuple[str, str], ...]:
     """Parse one deb822 stanza, keeping continuation lines intact."""
 
@@ -367,7 +440,11 @@ def _lookup(fields: tuple[tuple[str, str], ...], name: str) -> str | None:
     return None
 
 
-def _validate_fields(fields: tuple[tuple[str, str], ...], expected_arch: str) -> DebInfo:
+def _validate_fields(
+    fields: tuple[tuple[str, str], ...],
+    expected_arch: str,
+    md5sums: tuple[tuple[str, str], ...] | None = None,
+) -> DebInfo:
     package = _lookup(fields, "Package")
     version = _lookup(fields, "Version")
     architecture = _lookup(fields, "Architecture")
@@ -394,6 +471,7 @@ def _validate_fields(fields: tuple[tuple[str, str], ...], expected_arch: str) ->
         version=version,
         architecture=architecture,
         fields=fields,
+        md5sums=md5sums,
     )
 
 
@@ -410,6 +488,12 @@ def _inspect_via_dpkg_deb(path: Path, expected_arch: str) -> DebInfo | None:
             capture_output=True,
             timeout=30,
         )
+        md5_proc = subprocess.run(
+            [binary, "--ctrl-tarfile", str(path)],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
     except (subprocess.SubprocessError, OSError):
         return None
     try:
@@ -417,7 +501,20 @@ def _inspect_via_dpkg_deb(path: Path, expected_arch: str) -> DebInfo | None:
     except UnicodeDecodeError:
         return None
     fields = parse_control_text(text)
-    return _validate_fields(fields, expected_arch)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(md5_proc.stdout), mode="r|") as archive:
+            raw_md5sums: bytes | None = None
+            for member in archive:
+                if member.name.lstrip("./") == "md5sums" and member.isfile():
+                    stream = archive.extractfile(member)
+                    raw_md5sums = (
+                        stream.read(MAX_MD5SUMS_BYTES + 1) if stream else None
+                    )
+                    break
+    except (tarfile.TarError, OSError):
+        raw_md5sums = None
+    md5sums = parse_md5sums(raw_md5sums)
+    return _validate_fields(fields, expected_arch, md5sums)
 
 
 def inspect_deb(path: Path, expected_arch: str) -> DebInfo:
@@ -481,4 +578,5 @@ def _inspect_control(raw_control: bytes, control_member: str, expected_arch: str
         control_str = control_text.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise DebError("package control file is not valid UTF-8") from exc
-    return _validate_fields(parse_control_text(control_str), expected_arch)
+    md5sums = parse_md5sums(_extract_md5sums_bytes(control_tar))
+    return _validate_fields(parse_control_text(control_str), expected_arch, md5sums)

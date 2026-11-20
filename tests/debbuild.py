@@ -48,15 +48,27 @@ def build_deb(
     control: dict[str, str] | None = None,
     payload: bytes = b"payload\n",
     arch: str = "amd64",
+    md5sums: bytes | None = b"",
 ) -> Path:
+    """Build a .deb.
+
+    *md5sums* controls the control-archive ``md5sums`` member:
+
+    * ``b""`` (default) writes an empty member;
+    * a non-empty bytes value is written verbatim (use it for real or
+      deliberately malformed manifests);
+    * ``None`` omits the member entirely, as seen on packages without one.
+    """
+
     fields = dict(DEFAULT_CONTROL)
     fields["Architecture"] = arch
     if control:
         fields.update(control)
     control_text = "".join(f"{key}: {value}\n" for key, value in fields.items())
-    control_tar = _tar_gz(
-        {"control": control_text.encode(), "md5sums": b""}
-    )
+    control_members = {"control": control_text.encode()}
+    if md5sums is not None:
+        control_members["md5sums"] = md5sums
+    control_tar = _tar_gz(control_members)
     data_tar = _tar_gz(
         {"usr/share/doc/demo/README": payload},
     )

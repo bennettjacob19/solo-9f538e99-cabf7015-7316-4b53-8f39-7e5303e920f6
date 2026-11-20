@@ -51,6 +51,7 @@ from typing import Iterator
 
 from .config import Settings
 from .deb import DebError, DebInfo, inspect_deb
+from .evidence import BUILD_LIMIT, BuildRecord, build_identification
 from .indexer import (
     PackageEntry,
     gzip_bytes,
@@ -215,6 +216,18 @@ class Repository:
                     role TEXT NOT NULL,
                     PRIMARY KEY (publication_id, path)
                 );
+                CREATE TABLE IF NOT EXISTS package_builds (
+                    package TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    architecture TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    publication_id INTEGER NOT NULL REFERENCES publications(id),
+                    created_at TEXT NOT NULL,
+                    md5sums_json TEXT,
+                    PRIMARY KEY (package, version, architecture, sha256, publication_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_package_builds_lookup
+                    ON package_builds (package, version, architecture, publication_id DESC);
                 """
             )
         self.reconcile()
@@ -279,6 +292,67 @@ class Repository:
                 "ORDER BY id DESC LIMIT 1"
             ).fetchone()
         return self._row_to_publication(row) if row else None
+
+    # ------------------------------------------------------- build evidence
+    def identify_builds(self, package: str, version: str) -> dict[str, object]:
+        """Return the recent successful builds for *package*/*version*.
+
+        Builds are deduplicated by the ``.deb`` SHA-256; for each digest the
+        last successful publication carrying it wins.  The six most recent
+        digests (ordered by that publication) are returned with the minimum
+        set of md5sums paths that distinguish their retained manifests.
+
+        Failed publications never enter ``package_builds`` (the row is written
+        inside the same journal transaction as the publication and aborted
+        rows are excluded by the join), so they cannot appear here.  Manifests
+        are retained independently of the pool files, so recycled packages can
+        still be identified after garbage collection.
+        """
+
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT b.package, b.version, b.architecture, b.sha256, "
+                "       b.publication_id, b.created_at, b.md5sums_json "
+                "FROM package_builds AS b "
+                "JOIN publications AS p ON p.id = b.publication_id "
+                "WHERE b.package = ? AND b.version = ? AND p.state = 'committed' "
+                "ORDER BY b.publication_id DESC",
+                (package, version),
+            ).fetchall()
+
+        records: list[BuildRecord] = []
+        seen_digests: set[str] = set()
+        for row in rows:
+            digest = row["sha256"]
+            if digest in seen_digests:
+                # Rows are newest-first, so this is an older re-publication of
+                # the exact same build: keep the last successful release only.
+                continue
+            seen_digests.add(digest)
+            raw_manifest = row["md5sums_json"]
+            md5sums = (
+                tuple(tuple(pair) for pair in json.loads(raw_manifest))
+                if raw_manifest
+                else None
+            )
+            records.append(
+                BuildRecord(
+                    publication_id=row["publication_id"],
+                    package=row["package"],
+                    version=row["version"],
+                    architecture=row["architecture"],
+                    digest=digest,
+                    md5sums=md5sums,
+                    created_at=row["created_at"],
+                )
+            )
+            if len(records) == BUILD_LIMIT:
+                break
+
+        result = build_identification(records)
+        result["package"] = package
+        result["version"] = version
+        return result
 
     # ------------------------------------------------------------- publishing
     def publish(self, uploads: list[StagedUpload]) -> Publication:
@@ -416,6 +490,28 @@ class Repository:
                 "INSERT INTO publication_files (publication_id, path, role) "
                 "VALUES (?, ?, ?)",
                 [(publication_id, path, role) for path, role in plan],
+            )
+            # Retain the md5sums manifest from each control archive.  Packages
+            # without a usable manifest are still published (NULL manifest), so
+            # later queries can mark them as insufficient evidence rather than
+            # losing the build history.
+            build_rows = [
+                (
+                    info.package,
+                    info.version,
+                    info.architecture,
+                    entry.sha256,
+                    publication_id,
+                    created_at,
+                    json.dumps(info.md5sums) if info.md5sums else None,
+                )
+                for info, entry in pairs
+            ]
+            db.executemany(
+                "INSERT INTO package_builds (package, version, architecture, "
+                "sha256, publication_id, created_at, md5sums_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                build_rows,
             )
 
         try:
